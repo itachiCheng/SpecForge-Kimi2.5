@@ -308,7 +308,7 @@ class HiddenStatesGenerator:
     ) -> None:
         if (
             not self.debug_logits
-            or not is_tp_rank_0()
+            or dist.get_rank() != 0
             or self.tokenizer is None
             or batch_idx >= self.debug_logits_batches
             or not logits_list
@@ -330,19 +330,48 @@ class HiddenStatesGenerator:
             if logits_tensor is None:
                 print("[debug-logits] logits payload has no tensor, skip")
                 return
-            pred_ids = torch.argmax(logits_tensor, dim=-1).detach().cpu().tolist()
-            gold_ids = filtered_batch["input_ids"][0].detach().cpu().tolist()
+            if logits_tensor.dim() == 3:
+                logits_tensor = logits_tensor[0]
+
+            raw_input_ids = filtered_batch["input_ids"][0].to(logits_tensor.device)
+            raw_loss_mask = filtered_batch["loss_mask"][0].to(logits_tensor.device)
+            seq_len = min(logits_tensor.shape[0], raw_input_ids.shape[0])
+            if seq_len < 2:
+                print("[debug-logits] sequence too short for next-token check")
+                return
+
+            # Raw causal logits at position i predict the original token at i + 1.
+            pred_ids_tensor = torch.argmax(logits_tensor[: seq_len - 1], dim=-1)
+            gold_ids_tensor = raw_input_ids[1:seq_len]
+            mask_tensor = raw_loss_mask[1:seq_len].bool()
+
+            pred_ids = pred_ids_tensor.detach().cpu().tolist()
+            gold_ids = gold_ids_tensor.detach().cpu().tolist()
+            pred_masked = pred_ids_tensor[mask_tensor].detach().cpu().tolist()
+            gold_masked = gold_ids_tensor[mask_tensor].detach().cpu().tolist()
             tail = 16
             print(f"\n[debug-logits] batch={batch_idx}")
-            print(f"  pred_ids_tail: {pred_ids[-tail:]}")
-            print(f"  gold_ids_tail: {gold_ids[-tail:]}")
+            print("  alignment: raw_logits[i] -> input_ids[i + 1]")
+            print(f"  supervised_tokens: {len(gold_masked)}")
+            print(f"  pred_ids_tail(next): {pred_ids[-tail:]}")
+            print(f"  gold_ids_tail(next): {gold_ids[-tail:]}")
             print(
-                "  pred_text_tail: "
+                "  pred_text_tail(next): "
                 + self.tokenizer.decode(pred_ids[-tail:], skip_special_tokens=False)
             )
             print(
-                "  gold_text_tail: "
+                "  gold_text_tail(next): "
                 + self.tokenizer.decode(gold_ids[-tail:], skip_special_tokens=False)
+            )
+            print(f"  pred_ids(masked,next): {pred_masked}")
+            print(f"  gold_ids(masked,next): {gold_masked}")
+            print(
+                "  pred_text(masked,next): "
+                + self.tokenizer.decode(pred_masked, skip_special_tokens=False)
+            )
+            print(
+                "  gold_text(masked,next): "
+                + self.tokenizer.decode(gold_masked, skip_special_tokens=False)
             )
         except Exception as e:
             print(f"[debug-logits] failed to print logits preview: {e}")
