@@ -119,6 +119,10 @@ def _strip_image_placeholder(text: str) -> str:
     return text.replace("<image>\n", "").replace("<image>", "").lstrip()
 
 
+def _collapse_empty_think_before_reasoning(text: str) -> str:
+    return re.sub(r"<think>\s*</think>\s*<think>", "<think>", text)
+
+
 def _expand_kimi_media_pad(processor, text: str, image: str) -> str:
     media_token = "<|media_pad|>"
     if media_token not in text:
@@ -311,6 +315,7 @@ def preprocess_vlm_conversations(
         for text, image in zip(examples["text"], images):
             if image is not None:
                 media = {"type": "image", "image": image}
+                text = _collapse_empty_think_before_reasoning(text)
                 text = _expand_kimi_media_pad(processor, text, image)
                 try:
                     encoding = processor(
@@ -429,6 +434,7 @@ def preprocess_vlm_conversations(
             tokenize=False,
             add_generation_prompt=False,
         )
+        conversation = _collapse_empty_think_before_reasoning(conversation)
         conversation = _expand_kimi_media_pad(processor, conversation, image)
         if hasattr(processor, "media_processor"):
             encoding = processor(

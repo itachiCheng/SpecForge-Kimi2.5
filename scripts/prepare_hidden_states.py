@@ -784,7 +784,7 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(
         args.target_model_path, trust_remote_code=True
     )
-    cache_params_string = f"{args.data_path}-{args.max_length}-{args.chat_template}-{args.target_model_path}-{args.num_samples}-{args.is_preformatted}-vlm_media_pad_expand_v2_multimodal_content"
+    cache_params_string = f"{args.data_path}-{args.max_length}-{args.chat_template}-{args.target_model_path}-{args.num_samples}-{args.is_preformatted}-vlm_media_pad_expand_v3_multimodal_content_collapse_empty_think"
     cache_key = hashlib.md5(cache_params_string.encode()).hexdigest()
 
     # Preprocess on complete, un-sharded dataset
