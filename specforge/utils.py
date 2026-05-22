@@ -12,6 +12,62 @@ from transformers import AutoConfig, PretrainedConfig
 logger = logging.getLogger(__name__)
 
 
+def _maybe_json_loads(value):
+    if not isinstance(value, str):
+        return value
+    try:
+        return json.loads(value)
+    except json.JSONDecodeError:
+        return value
+
+
+def _resolve_data_path(file_path, maybe_path):
+    if not isinstance(maybe_path, str) or not maybe_path:
+        return maybe_path
+    if os.path.isabs(maybe_path):
+        return maybe_path
+    return os.path.abspath(os.path.join(os.path.dirname(file_path), maybe_path))
+
+
+def _normalize_multimodal_content(content, file_path):
+    content = _maybe_json_loads(content)
+    if not isinstance(content, list):
+        return content, None
+
+    text_parts = []
+    image_path = None
+    passthrough_parts = []
+
+    for item in content:
+        if not isinstance(item, dict):
+            passthrough_parts.append(item)
+            continue
+
+        item_type = item.get("type")
+        if item_type == "text":
+            text = item.get("text", "")
+            if text:
+                text_parts.append(str(text))
+        elif item_type == "image":
+            image = item.get("image")
+            if image_path is None and image is not None:
+                image_path = _resolve_data_path(file_path, image)
+        elif item_type == "image_url":
+            image_url = item.get("image_url")
+            if isinstance(image_url, dict):
+                image_url = image_url.get("url")
+            if image_path is None and image_url is not None:
+                image_path = image_url
+        else:
+            passthrough_parts.append(item)
+
+    if text_parts:
+        return "\n".join(text_parts), image_path
+    if not passthrough_parts:
+        return "", image_path
+    return json.dumps(content, ensure_ascii=False), image_path
+
+
 @contextmanager
 def rank_0_priority():
     rank = dist.get_rank()
@@ -357,6 +413,7 @@ def safe_conversations_generator(file_path):
                         continue
 
                 cleaned_convs = []
+                extracted_image = None
                 for msg in raw_convs:
                     # 2. Ensure each item in the list is a dictionary
                     if not isinstance(msg, dict):
@@ -366,6 +423,14 @@ def safe_conversations_generator(file_path):
                     # 3. [Core logic] Iterate over all fields in the message (role, content, tools, etc.)
                     new_msg = {}
                     for k, v in msg.items():
+                        if k == "content":
+                            normalized_content, content_image = (
+                                _normalize_multimodal_content(v, file_path)
+                            )
+                            if content_image is not None and extracted_image is None:
+                                extracted_image = content_image
+                            v = normalized_content
+
                         # If the value is a list or dict, serialize it to a JSON string
                         # This ensures Arrow treats the column as string type instead of list/struct
                         if isinstance(v, (list, dict)):
@@ -387,7 +452,12 @@ def safe_conversations_generator(file_path):
                     if isinstance(value, (list, dict)):
                         result[key] = json.dumps(value, ensure_ascii=False)
                     else:
+                        if key == "image":
+                            value = _resolve_data_path(file_path, value)
                         result[key] = value
+
+                if "image" not in result and extracted_image is not None:
+                    result["image"] = extracted_image
 
                 # Preserve 'tools' field if present
                 if "tools" in row:
