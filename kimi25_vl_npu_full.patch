@@ -1,0 +1,680 @@
+diff --git a/scripts/prepare_hidden_states.py b/scripts/prepare_hidden_states.py
+index 30ce919..b469d02 100644
+--- a/scripts/prepare_hidden_states.py
++++ b/scripts/prepare_hidden_states.py
+@@ -47,6 +47,13 @@ import torch.distributed as dist
+ from tqdm import tqdm
+ from transformers import AutoConfig, AutoProcessor, AutoTokenizer
+ 
++try:
++    # Importing this module registers SGLang's local config classes, including
++    # kimi_k25, with Transformers AutoConfig.
++    import sglang.srt.utils.hf_transformers_utils  # noqa: F401
++except ImportError:
++    pass
++
+ from datasets import Dataset
+ from specforge.args import SGLangBackendArgs
+ from specforge.data import build_eagle3_dataset, prepare_dp_dataloaders
+@@ -66,6 +73,21 @@ from specforge.utils import (
+ )
+ 
+ 
++def _get_runtime_device() -> torch.device:
++    if hasattr(torch, "npu") and torch.npu.is_available():
++        return torch.device("npu")
++    if torch.cuda.is_available():
++        return torch.device("cuda")
++    return torch.device("cpu")
++
++
++def _empty_device_cache(device: torch.device) -> None:
++    if device.type == "npu" and hasattr(torch, "npu"):
++        torch.npu.empty_cache()
++    elif device.type == "cuda":
++        torch.cuda.empty_cache()
++
++
+ @dataclass
+ class DataPoint:
+     input_ids: torch.Tensor
+@@ -169,6 +191,11 @@ def build_target_model(
+     For VLM models (Qwen2.5-VL) without TP, load directly from transformers.
+     Otherwise, use the Eagle3 target model wrapper.
+     """
++    torch_dtype = getattr(model_config, "dtype", None) or getattr(
++        model_config, "torch_dtype", None
++    )
++    runtime_device = _get_runtime_device()
++    runtime_device_type = runtime_device.type
+     if args.is_vlm and model_config.model_type == "qwen2_5_vl" and args.tp_size == 1:
+         # TODO: replace with sglang
+         from transformers import Qwen2_5_VLForConditionalGeneration
+@@ -176,26 +203,20 @@ def build_target_model(
+         target_model = (
+             Qwen2_5_VLForConditionalGeneration.from_pretrained(
+                 pretrained_model_name_or_path=args.target_model_path,
+-                torch_dtype=(
+-                    model_config.dtype
+-                    if hasattr(model_config, "dtype")
+-                    else model_config.torch_dtype
+-                ),
++                torch_dtype=torch_dtype,
+             )
+             .eval()
+-            .cuda()
++            .to(runtime_device)
+         )
+     else:
+         target_model_kwargs = SGLangBackendArgs.from_args(args).to_kwargs()
++        if args.is_vlm:
++            target_model_kwargs["enable_multimodal"] = True
+         target_model = get_eagle3_target_model(
+             pretrained_model_name_or_path=args.target_model_path,
+             backend="sglang",  # we set this as the default backend to minimize precision mismatch in training and serving
+-            torch_dtype=(
+-                model_config.dtype
+-                if hasattr(model_config, "dtype")
+-                else model_config.torch_dtype
+-            ),
+-            device="cuda",
++            torch_dtype=torch_dtype,
++            device=runtime_device_type,
+             cache_dir=args.model_download_dir,
+             trust_remote_code=args.trust_remote_code,
+             **target_model_kwargs,
+@@ -204,7 +225,9 @@ def build_target_model(
+     target_model.set_aux_hidden_states_layers(args.aux_hidden_states_layers)
+ 
+     if args.is_vlm:
+-        processor = AutoProcessor.from_pretrained(args.target_model_path)
++        processor = AutoProcessor.from_pretrained(
++            args.target_model_path, trust_remote_code=args.trust_remote_code
++        )
+     else:
+         processor = None
+ 
+@@ -225,6 +248,7 @@ class HiddenStatesGenerator:
+         self,
+         target_model,
+         enable_aux_hidden_states: bool = True,
++        is_vlm: bool = False,
+         num_io_threads: int = 4,
+         io_queue_size: int = 50,
+         file_group_size: int = 2000,
+@@ -241,6 +265,8 @@ class HiddenStatesGenerator:
+         """
+         self.model = target_model
+         self.enable_aux_hidden_states = enable_aux_hidden_states
++        self.is_vlm = is_vlm
++        self.device = _get_runtime_device()
+ 
+         # --- Configurable parameters ---
+         self.num_io_threads = num_io_threads
+@@ -257,6 +283,42 @@ class HiddenStatesGenerator:
+         self.io_executor = None
+         self.pending_futures = []
+ 
++    def _filter_vlm_tensors(self, batch, valid_indices_in_batch):
++        vlm_batch = {}
++        grid_key = "grid_thws" if "grid_thws" in batch else "image_grid_thw"
++        if grid_key not in batch or "pixel_values" not in batch:
++            return vlm_batch
++
++        grid = batch[grid_key]
++        if grid.dim() == 1:
++            grid = grid.unsqueeze(0)
++        if grid.shape[0] != batch["input_ids"].shape[0]:
++            raise ValueError(
++                f"Cannot align {grid_key} with batch: got {grid.shape[0]} grid rows for "
++                f"{batch['input_ids'].shape[0]} samples. Multi-image samples should be "
++                "preprocessed with batch_size=1 for hidden-state preparation."
++            )
++
++        patch_counts = (grid[:, 0] * grid[:, 1] * grid[:, 2]).tolist()
++        starts = []
++        offset = 0
++        for count in patch_counts:
++            starts.append(offset)
++            offset += int(count)
++
++        selected_grids = []
++        selected_pixels = []
++        for sample_idx in valid_indices_in_batch:
++            count = int(patch_counts[sample_idx])
++            start = starts[sample_idx]
++            selected_grids.append(grid[sample_idx : sample_idx + 1])
++            selected_pixels.append(batch["pixel_values"][start : start + count])
++
++        if selected_pixels:
++            vlm_batch["pixel_values"] = torch.cat(selected_pixels, dim=0)
++            vlm_batch[grid_key] = torch.cat(selected_grids, dim=0)
++        return vlm_batch
++
+     def __enter__(self):
+         """Initializes resources when entering a 'with' block."""
+         if is_tp_rank_0():
+@@ -463,11 +525,11 @@ class HiddenStatesGenerator:
+                     output_path, current_batch_indices
+                 )
+                 exists_tensor = torch.tensor(
+-                    exists_list, dtype=torch.bool, device="cuda"
++                    exists_list, dtype=torch.bool, device=self.device
+                 )
+             else:
+                 exists_tensor = torch.tensor(
+-                    [False] * batch_size, dtype=torch.bool, device="cuda"
++                    [False] * batch_size, dtype=torch.bool, device=self.device
+                 )
+             dist.broadcast(exists_tensor, src=tp_rank_0_global, group=tp_group)
+ 
+@@ -488,6 +550,11 @@ class HiddenStatesGenerator:
+                 "attention_mask": batch["attention_mask"][valid_indices_in_batch],
+                 "loss_mask": batch["loss_mask"][valid_indices_in_batch],
+             }
++            filtered_batch.update(
++                self._filter_vlm_tensors(batch, valid_indices_in_batch)
++                if self.is_vlm
++                else {}
++            )
+             del batch
+             if num_valid == 0:
+                 # Data has already been generated, no sample processing, update progress bar.
+@@ -504,13 +571,33 @@ class HiddenStatesGenerator:
+                 continue
+ 
+             filtered_batch_gpu = {
+-                k: v.cuda(non_blocking=True) for k, v in filtered_batch.items()
++                k: v.to(self.device, non_blocking=True) for k, v in filtered_batch.items()
+             }
+-            _, _, aux_hidden_states_list, last_hidden_states_list = self.model.extend(
+-                **filtered_batch_gpu,
+-                return_last_hidden_states=True,
+-                return_logits=False,
+-            )
++            if self.is_vlm and (
++                "pixel_values" in filtered_batch_gpu
++                and ("image_grid_thw" in filtered_batch_gpu or "grid_thws" in filtered_batch_gpu)
++            ):
++                _, _, aux_hidden_states_list, last_hidden_states_list = (
++                    self.model.extend_vlm(
++                        input_ids=filtered_batch_gpu["input_ids"],
++                        attention_mask=filtered_batch_gpu["attention_mask"],
++                        loss_mask=filtered_batch_gpu["loss_mask"],
++                        pixel_values=filtered_batch_gpu["pixel_values"],
++                        image_grid_thw=filtered_batch_gpu.get(
++                            "grid_thws", filtered_batch_gpu.get("image_grid_thw")
++                        ),
++                        return_last_hidden_states=True,
++                        return_logits=False,
++                    )
++                )
++            else:
++                _, _, aux_hidden_states_list, last_hidden_states_list = self.model.extend(
++                    input_ids=filtered_batch_gpu["input_ids"],
++                    attention_mask=filtered_batch_gpu["attention_mask"],
++                    loss_mask=filtered_batch_gpu["loss_mask"],
++                    return_last_hidden_states=True,
++                    return_logits=False,
++                )
+ 
+             del filtered_batch_gpu
+ 
+@@ -559,7 +646,7 @@ class HiddenStatesGenerator:
+             del aux_hidden_states_list, last_hidden_states_list, filtered_batch
+ 
+             if batch_idx % 5 == 0:  # Make GC and cache clearing more frequent
+-                torch.cuda.empty_cache()
++                _empty_device_cache(self.device)
+                 gc.collect()
+ 
+             if self.show_progress:
+@@ -694,6 +781,7 @@ def main():
+         with HiddenStatesGenerator(
+             target_model,
+             enable_aux_hidden_states=args.enable_aux_hidden_states,
++            is_vlm=args.is_vlm,
+             num_io_threads=args.num_io_threads,
+             io_queue_size=args.io_queue_size,
+             file_group_size=args.file_group_size,
+diff --git a/specforge/data/preprocessing.py b/specforge/data/preprocessing.py
+index d5af947..272ff8f 100644
+--- a/specforge/data/preprocessing.py
++++ b/specforge/data/preprocessing.py
+@@ -115,6 +115,10 @@ def _apply_loss_mask_from_chat_template(
+     return loss_mask
+ 
+ 
++def _strip_image_placeholder(text: str) -> str:
++    return text.replace("<image>\n", "").replace("<image>", "").lstrip()
++
++
+ # Copied from https://github.com/SafeAILab/EAGLE/blob/main/eagle/traineagle3/cnets.py
+ def preprocess_conversations(
+     tokenizer: PreTrainedTokenizer,
+@@ -182,6 +186,7 @@ def preprocess_vlm_conversations(
+     examples: List[Conversation],
+     chat_template: ChatTemplate,
+     max_length: int = 2048,
++    is_preformatted: bool = False,
+ ) -> Dict[str, List[torch.Tensor]]:
+     """
+     Preprocess a batch of ShareGPT style conversations.
+@@ -211,8 +216,89 @@ def preprocess_vlm_conversations(
+         "attention_mask": [],
+         "pixel_values": [],
+         "image_grid_thw": [],
++        "grid_thws": [],
+     }
+ 
++    if is_preformatted:
++        if "text" not in examples:
++            raise ValueError(
++                f"Expected 'text' column for is_preformatted=True, but found columns: {list(examples.keys())}"
++            )
++        images = examples.get("image", [None] * len(examples["text"]))
++        for text, image in zip(examples["text"], images):
++            if image is not None:
++                media = {"type": "image", "image": image}
++                try:
++                    encoding = processor(
++                        text=[text],
++                        medias=[media],
++                        max_length=max_length,
++                        truncation=True,
++                        return_tensors="pt",
++                        return_offsets_mapping=True,
++                        add_special_tokens=False,
++                    )
++                except (TypeError, ValueError):
++                    if not HAS_QWEN_VL_UTILS:
++                        raise ImportError(
++                            "qwen_vl_utils is required for this VLM processor but is not installed."
++                        )
++                    messages = [
++                        {
++                            "role": "user",
++                            "content": [
++                                {"type": "image", "image": image},
++                                {"type": "text", "text": text},
++                            ],
++                        }
++                    ]
++                    image_inputs, video_inputs = process_vision_info(messages)
++                    encoding = processor(
++                        text=[text],
++                        images=image_inputs,
++                        videos=video_inputs,
++                        max_length=max_length,
++                        truncation=True,
++                        return_tensors="pt",
++                        return_offsets_mapping=True,
++                        add_special_tokens=False,
++                    )
++            else:
++                encoding = processor.tokenizer(
++                    text,
++                    max_length=max_length,
++                    truncation=True,
++                    return_tensors="pt",
++                    return_offsets_mapping=True,
++                    add_special_tokens=False,
++                )
++
++            input_ids = encoding.input_ids[0]
++            offsets = encoding.offset_mapping[0]
++            decoded_conversation = processor.tokenizer.decode(
++                input_ids, skip_special_tokens=False
++            )
++            loss_mask = _apply_loss_mask_from_chat_template(
++                decoded_conversation, offsets, chat_template
++            )
++
++            results["input_ids"].append(input_ids[None, :])
++            results["loss_mask"].append(loss_mask[None, :])
++            results["attention_mask"].append(torch.ones_like(loss_mask)[None, :])
++            if "pixel_values" in encoding:
++                results["pixel_values"].append(encoding.pixel_values)
++            if "image_grid_thw" in encoding:
++                image_grid_thw = encoding.image_grid_thw
++                if image_grid_thw.dim() == 1:
++                    image_grid_thw = image_grid_thw[None, :]
++                results["image_grid_thw"].append(image_grid_thw)
++            if "grid_thws" in encoding:
++                grid_thws = encoding.grid_thws
++                if grid_thws.dim() == 1:
++                    grid_thws = grid_thws[None, :]
++                results["grid_thws"].append(grid_thws)
++        return {k: v for k, v in results.items() if v}
++
+     # Note: currently, we assume that each example has only one image
+     for i, image in enumerate(examples["image"]):
+         source = examples["conversations"][i]
+@@ -230,6 +316,7 @@ def preprocess_vlm_conversations(
+             role = sentence["role"]
+             assert role == convroles[j % 2], f"unexpected role {role}"
+             if role == "user":
++                user_content = _strip_image_placeholder(sentence["content"])
+                 # if the message is from user and has image, process the image
+                 messages.append(
+                     {
+@@ -239,7 +326,7 @@ def preprocess_vlm_conversations(
+                                 "type": "image",
+                                 "image": image,
+                             },
+-                            {"type": "text", "text": sentence["content"]},
++                            {"type": "text", "text": user_content},
+                         ],
+                     }
+                 )
+@@ -251,29 +338,39 @@ def preprocess_vlm_conversations(
+             tokenize=False,
+             add_generation_prompt=False,
+         )
+-        # get vision infor use qwen_vl_utils
+-        if not HAS_QWEN_VL_UTILS:
+-            raise ImportError(
+-                "qwen_vl_utils is required for VLM preprocessing but is not installed. "
+-                "Please install it to use VLM features."
++        if hasattr(processor, "media_processor"):
++            encoding = processor(
++                text=[conversation],
++                medias=[{"type": "image", "image": image}],
++                max_length=max_length,
++                truncation=True,
++                return_tensors="pt",
++                return_offsets_mapping=True,
++                add_special_tokens=False,
++            )
++        else:
++            # get vision infor use qwen_vl_utils
++            if not HAS_QWEN_VL_UTILS:
++                raise ImportError(
++                    "qwen_vl_utils is required for VLM preprocessing but is not installed. "
++                    "Please install it to use VLM features."
++                )
++            image_inputs, video_inputs = process_vision_info(messages)
++            assert image_inputs is not None, "image_inputs must not be None"
++
++            encoding = processor(
++                text=[conversation],
++                images=image_inputs,
++                videos=video_inputs,
++                max_length=max_length,
++                truncation=True,
++                return_tensors="pt",
++                return_offsets_mapping=True,
++                add_special_tokens=False,
+             )
+-        image_inputs, video_inputs = process_vision_info(messages)
+-        assert image_inputs is not None, "image_inputs must not be None"
+-
+-        encoding = processor(
+-            text=[conversation],
+-            images=image_inputs,
+-            videos=video_inputs,
+-            max_length=max_length,
+-            truncation=True,
+-            return_tensors="pt",
+-            return_offsets_mapping=True,
+-            add_special_tokens=False,
+-        )
+         input_ids = encoding.input_ids[0]
+         offsets = encoding.offset_mapping[0]
+         pixel_values = encoding.pixel_values
+-        image_grid_thw = encoding.image_grid_thw[0]
+ 
+         # get conversation with image info for loss mask generation
+         decoded_conversation = processor.tokenizer.decode(
+@@ -289,8 +386,17 @@ def preprocess_vlm_conversations(
+         results["loss_mask"].append(loss_mask[None, :])
+         results["attention_mask"].append(torch.ones_like(loss_mask)[None, :])
+         results["pixel_values"].append(pixel_values)
+-        results["image_grid_thw"].append(image_grid_thw[None, :])
+-    return results
++        if "image_grid_thw" in encoding:
++            image_grid_thw = encoding.image_grid_thw
++            if image_grid_thw.dim() == 1:
++                image_grid_thw = image_grid_thw[None, :]
++            results["image_grid_thw"].append(image_grid_thw)
++        if "grid_thws" in encoding:
++            grid_thws = encoding.grid_thws
++            if grid_thws.dim() == 1:
++                grid_thws = grid_thws[None, :]
++            results["grid_thws"].append(grid_thws)
++    return {k: v for k, v in results.items() if v}
+ 
+ 
+ def build_eagle3_dataset(
+@@ -361,6 +467,7 @@ def build_eagle3_dataset(
+                 examples,
+                 template,
+                 max_length,
++                is_preformatted=is_preformatted,
+             )
+         elif is_preformatted:
+             # Handle pre-formatted text (should be in "text" column)
+diff --git a/specforge/data/utils.py b/specforge/data/utils.py
+index 93fd6f5..df215e5 100644
+--- a/specforge/data/utils.py
++++ b/specforge/data/utils.py
+@@ -218,21 +218,25 @@ class VlmDataCollatorWithPadding:
+         batch_loss_mask = torch.cat(
+             [self.paddingtensor2D(item["loss_mask"], max_length) for item in features]
+         )
+-        batch_pixel_values = torch.cat(
+-            [item["pixel_values"] for item in features], dim=0
+-        )
+-        batch_image_grid_thw = torch.cat(
+-            [item["image_grid_thw"] for item in features], dim=0
+-        )
+         batch = {
+             "input_ids": batch_input_ids,
+             "attention_mask": batch_attention_mask,
+             "loss_mask": batch_loss_mask,
+-            "pixel_values": batch_pixel_values,
+-            "image_grid_thw": batch_image_grid_thw,
+             "hidden_state": None,
+             "target": None,
+         }
++        if all("pixel_values" in item and item["pixel_values"] is not None for item in features):
++            batch["pixel_values"] = torch.cat(
++                [item["pixel_values"] for item in features], dim=0
++            )
++        if all("image_grid_thw" in item and item["image_grid_thw"] is not None for item in features):
++            batch["image_grid_thw"] = torch.cat(
++                [item["image_grid_thw"] for item in features], dim=0
++            )
++        if all("grid_thws" in item and item["grid_thws"] is not None for item in features):
++            batch["grid_thws"] = torch.cat(
++                [item["grid_thws"] for item in features], dim=0
++            )
+         if all("hidden_state" in item for item in features):
+             assert all(
+                 "target" in item for item in features
+diff --git a/specforge/modeling/target/eagle3_target_model.py b/specforge/modeling/target/eagle3_target_model.py
+index 2acf50b..7193642 100644
+--- a/specforge/modeling/target/eagle3_target_model.py
++++ b/specforge/modeling/target/eagle3_target_model.py
+@@ -39,6 +39,14 @@ from .sglang_backend import SGLangRunner, wrap_eagle3_logits_processors_in_modul
+ from .sglang_backend.utils import LogitsProcessorForEAGLE3
+ 
+ 
++def _get_current_accelerator_index() -> int:
++    if hasattr(torch, "npu") and torch.npu.is_available():
++        return torch.npu.current_device()
++    if torch.cuda.is_available():
++        return torch.cuda.current_device()
++    return 0
++
++
+ @dataclass
+ class Eagle3TargetOutput:
+     hidden_states: torch.Tensor
+@@ -287,6 +295,10 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
+ 
+         # Special token IDs from hf_config
+         self.image_token_id = getattr(self.hf_config, "image_token_id", None)
++        if self.image_token_id is None:
++            self.image_token_id = getattr(
++                self.hf_config, "media_placeholder_token_id", None
++            )
+         self.video_token_id = getattr(self.hf_config, "video_token_id", None)
+         self.vision_start_token_id = getattr(
+             self.hf_config, "vision_start_token_id", None
+@@ -326,7 +338,7 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
+         model_runner = SGLangRunner(
+             model_config=model_config,
+             mem_fraction_static=server_args.mem_fraction_static,
+-            gpu_id=torch.cuda.current_device(),
++            gpu_id=_get_current_accelerator_index(),
+             tp_rank=dist.get_rank(get_tp_group()),
+             tp_size=server_args.tp_size,
+             moe_ep_rank=moe_ep_rank,
+@@ -422,6 +434,21 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
+         self.model_runner.token_to_kv_pool_allocator.clear()
+         return logits, aux_hidden_states_list, last_hidden_states
+ 
++    def _split_grid_thw_by_sample(
++        self,
++        grid_thw: Optional[torch.Tensor | List[torch.Tensor]],
++        batch_size: int,
++    ) -> List[Optional[torch.Tensor]]:
++        if grid_thw is None:
++            return [None] * batch_size
++        if isinstance(grid_thw, (list, tuple)):
++            return list(grid_thw)
++        if grid_thw.dim() == 1:
++            return [grid_thw.unsqueeze(0)]
++        if grid_thw.dim() == 2 and grid_thw.shape[0] == batch_size:
++            return [grid_thw[i : i + 1] for i in range(batch_size)]
++        return [grid_thw]
++
+     def _maybe_prepare_mlp_sync_batch(self, batch: ScheduleBatch):
+         if require_mlp_sync(self.model_runner.server_args):
+             # - Removed spec_algorithm and speculative_num_draft_tokens parameters
+@@ -563,14 +590,12 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
+         else:
+             batch_size = len(input_ids)
+         # Process image_grid_thw - convert to list if needed
+-        if image_grid_thw is None:
+-            image_grid_thw = [None] * batch_size
+-        elif not isinstance(image_grid_thw, (list, tuple)):
+-            image_grid_thw = [image_grid_thw]
++        image_grid_thw = self._split_grid_thw_by_sample(image_grid_thw, batch_size)
+ 
+         # pixel_values is a single 2D tensor (total_patches, patch_dim) for Qwen2.5-VL
+         # We need to track offset and slice it based on image_grid_thw for each sample
+         pixel_values_offset = 0  # Track current offset in pixel_values
++        is_kimi_k25 = self.model_type == "kimi_k25"
+ 
+         for idx, (input_id_, attention_mask_, loss_mask_, image_grid_thw_) in enumerate(
+             zip(
+@@ -603,6 +628,11 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
+                 )
+                 num_patches = int(num_patches)
+ 
++                if pixel_values is None:
++                    raise ValueError(
++                        "pixel_values must be provided for VLM samples with image/grid metadata"
++                    )
++
+                 # Slice pixel_values for this sample
+                 pixel_value_ = pixel_values[
+                     pixel_values_offset : pixel_values_offset + num_patches
+@@ -614,24 +644,24 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
+ 
+             # Compute mrope positions for VLM models (e.g., Qwen2.5-VL)
+             input_id_flat = input_id_.view(-1)
++            if image_grid_thw_ is None or pixel_value_ is None:
++                req = Req(
++                    rid=str(idx),
++                    origin_input_text="",
++                    origin_input_ids=input_id_flat.tolist(),
++                    sampling_params=sampling_params,
++                )
++                req.fill_ids = req.origin_input_ids
++                req.extend_input_len = len(req.fill_ids) - len(req.prefix_indices)
++                req.logprob_start_len = len(req.origin_input_ids) - 1
++                data_cache.append([input_id_, attention_mask_, loss_mask_])
++                reqs.append(req)
++                continue
+ 
+             # Count image tokens
+             num_img_tokens = (input_id_flat == self.image_token_id).sum().item()
+             # print(f"[extend_vlm] num_img_tokens in input_ids: {num_img_tokens}")
+ 
+-            mrope_positions, mrope_position_delta = MRotaryEmbedding.get_rope_index(
+-                spatial_merge_size=self.spatial_merge_size,
+-                image_token_id=self.image_token_id,
+-                video_token_id=self.video_token_id,
+-                vision_start_token_id=self.vision_start_token_id,
+-                model_type=self.model_type,
+-                input_ids=input_id_flat.unsqueeze(0).cpu(),
+-                image_grid_thw=(
+-                    image_grid_thw_.cpu() if image_grid_thw_ is not None else None
+-                ),
+-                tokens_per_second=self.tokens_per_second,
+-            )
+-
+             offset = BaseMultimodalProcessor.get_mm_items_offset(
+                 input_id_flat, self.image_token_id
+             )
+@@ -641,7 +671,21 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
+                 pad_value=self.image_token_id,  # Required for placeholder tensor creation
+                 offsets=offset,  # List of (start, end) tuples
+             )
+-            mm_item.set("image_grid_thw", image_grid_thw_.cpu())
++            if is_kimi_k25:
++                mm_item.set("grid_thws", image_grid_thw_.cpu())
++                mrope_positions, mrope_position_delta = None, None
++            else:
++                mrope_positions, mrope_position_delta = MRotaryEmbedding.get_rope_index(
++                    spatial_merge_size=self.spatial_merge_size,
++                    image_token_id=self.image_token_id,
++                    video_token_id=self.video_token_id,
++                    vision_start_token_id=self.vision_start_token_id,
++                    model_type=self.model_type,
++                    input_ids=input_id_flat.unsqueeze(0).cpu(),
++                    image_grid_thw=image_grid_thw_.cpu(),
++                    tokens_per_second=self.tokens_per_second,
++                )
++                mm_item.set("image_grid_thw", image_grid_thw_.cpu())
+             mm_item.set_pad_value()
+             mm_inputs = MultimodalInputs(
+                 mm_items=[mm_item],
+@@ -653,10 +697,13 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
+                 ),
+                 mrope_position_delta=mrope_position_delta,
+             )
+-            pattern = MultiModalityDataPaddingPatternMultimodalTokens()
+-            input_id_list = pattern.pad_input_tokens(
+-                input_id_.view(-1).tolist(), mm_inputs
+-            )
++            if is_kimi_k25:
++                input_id_list = input_id_flat.tolist()
++            else:
++                pattern = MultiModalityDataPaddingPatternMultimodalTokens()
++                input_id_list = pattern.pad_input_tokens(
++                    input_id_.view(-1).tolist(), mm_inputs
++                )
+             req = Req(
+                 rid=str(idx),
+                 origin_input_text="",
+@@ -687,6 +734,7 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
+         loss_mask: torch.Tensor,
+         pixel_values: Optional[torch.Tensor] = None,
+         image_grid_thw: Optional[torch.Tensor] = None,
++        grid_thws: Optional[torch.Tensor] = None,
+         is_vlm: bool = False,
+     ) -> Eagle3TargetOutput:
+         """
+@@ -709,7 +757,7 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
+                     return_last_hidden_states=False,
+                     return_logits=True,
+                     pixel_values=pixel_values,
+-                    image_grid_thw=image_grid_thw,
++                    image_grid_thw=grid_thws if grid_thws is not None else image_grid_thw,
+                 )
+             )
+         else:
