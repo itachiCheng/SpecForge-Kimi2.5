@@ -945,6 +945,67 @@ def generate_vocab_mapping_file(
     return vocab_mapping_path
 
 
+def generate_vocab_mapping_file_from_hidden_states(
+    hidden_states_path: str,
+    target_vocab_size: int,
+    draft_vocab_size: int,
+    cache_dir: str = "./cache/vocab_mapping",
+    cache_key: str = "vocab_mapping",
+    max_length: Optional[int] = None,
+) -> str:
+    """
+    Generate a vocab mapping file directly from offline hidden-state files.
+
+    This keeps offline training aligned with the exact input_ids/loss_mask that were
+    saved by prepare_hidden_states.py and avoids rebuilding a VLM dataset from JSON.
+    """
+    os.makedirs(cache_dir, exist_ok=True)
+    vocab_mapping_path = os.path.join(cache_dir, f"{cache_key}.pt")
+
+    if os.path.exists(vocab_mapping_path):
+        print(f"Loading vocab mapping from the cached file at: {vocab_mapping_path}")
+        return vocab_mapping_path
+
+    token_dict = Counter()
+    datapaths = list_local_files(hidden_states_path)
+    for data_path in tqdm(datapaths, desc="Counting tokens from hidden states"):
+        if data_path.endswith(".gz"):
+            with gzip.open(data_path, "rb") as f:
+                data = torch.load(io.BytesIO(f.read()), weights_only=False)
+        else:
+            data = torch.load(data_path, map_location="cpu", weights_only=False)
+
+        input_ids = data["input_ids"]
+        loss_mask = data["loss_mask"]
+        if input_ids.ndim > 1:
+            input_ids = input_ids.squeeze(0)
+        if loss_mask.ndim > 1:
+            loss_mask = loss_mask.squeeze(0)
+        if max_length is not None:
+            input_ids = input_ids[:max_length]
+            loss_mask = loss_mask[:max_length]
+
+        masked_ids = input_ids[loss_mask.bool()]
+        if masked_ids.numel() == 0:
+            continue
+        unique_ids, counts = masked_ids.unique(return_counts=True)
+        token_dict.update(dict(zip(unique_ids.tolist(), counts.tolist())))
+
+    d2t, t2d = process_token_dict_to_mappings(
+        token_dict,
+        draft_vocab_size,
+        target_vocab_size,
+    )
+
+    vocab_mapping = {
+        "d2t": d2t,
+        "t2d": t2d,
+    }
+    torch.save(vocab_mapping, vocab_mapping_path)
+    print(f"Saved vocab mapping to: {vocab_mapping_path}")
+    return vocab_mapping_path
+
+
 def process_token_dict_to_mappings(
     token_dict: Counter,
     draft_vocab_size: int,

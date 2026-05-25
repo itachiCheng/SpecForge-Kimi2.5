@@ -29,6 +29,7 @@ from specforge.data import (
     build_eagle3_dataset,
     build_offline_eagle3_dataset,
     generate_vocab_mapping_file,
+    generate_vocab_mapping_file_from_hidden_states,
     prepare_dp_dataloaders,
 )
 from specforge.distributed import (
@@ -99,7 +100,7 @@ def parse_args() -> Tuple[ArgumentParser, Namespace]:
 
     # dataset arguments
     dataset_group = parser.add_argument_group("dataset")
-    dataset_group.add_argument("--train-data-path", type=str, required=True)
+    dataset_group.add_argument("--train-data-path", type=str, default=None)
     dataset_group.add_argument("--train-hidden-states-path", type=str, default=None)
     dataset_group.add_argument("--eval-hidden-states-path", type=str, default=None)
     dataset_group.add_argument("--eval-data-path", type=str, default=None)
@@ -339,6 +340,11 @@ def sanity_check(args: Namespace) -> None:
     """
     args.dp_size = dist.get_world_size() // args.tp_size
     args.target_batch_size = args.tp_size * args.batch_size
+    if args.train_data_path is None and args.train_hidden_states_path is None:
+        raise ValueError(
+            "Either --train-data-path for online training or "
+            "--train-hidden-states-path for offline training must be provided."
+        )
     if args.attention_backend == "usp":
         sp_sanity_check(args)
 
@@ -441,49 +447,66 @@ def build_dataloaders(
     draft_model_config: AutoDraftModelConfig,
     processor: Optional[AutoProcessor] = None,
 ) -> Tuple[DataLoader, str, Optional[DataLoader]]:
-    # build dataloaders
-    tokenizer = AutoTokenizer.from_pretrained(
-        args.target_model_path, trust_remote_code=args.trust_remote_code
-    )
-
-    # convert to dataloader
-    cache_params_string = (
-        f"{args.train_data_path}-"
-        f"{args.max_length}-"
-        f"{args.chat_template}-"
-        f"{args.target_model_path}"  # Tokenizer may also different
-    )
-    cache_key = hashlib.md5(cache_params_string.encode()).hexdigest()
-    train_dataset = Dataset.from_generator(
-        generator=safe_conversations_generator,
-        gen_kwargs={"file_path": args.train_data_path},
-    )
     is_online = (
         args.train_data_path is not None and args.train_hidden_states_path is None
     )
-    with rank_0_priority():
-        train_eagle3_dataset = build_eagle3_dataset(
-            dataset=train_dataset,
-            tokenizer=tokenizer,
-            chat_template=args.chat_template,
-            max_length=args.max_length,
-            cache_dir=os.path.join(args.cache_dir, "processed_dataset"),
-            cache_key=cache_key,
-            is_vlm=args.is_vlm,
-            is_preformatted=args.is_preformatted,
-            processor=processor,
-            num_proc=args.build_dataset_num_proc,
-            train_only_last_turn=args.train_only_last_turn,
-        )
-        vocab_mapping_path = generate_vocab_mapping_file(
-            dataset=train_eagle3_dataset,
-            target_vocab_size=draft_model_config.vocab_size,
-            draft_vocab_size=draft_model_config.draft_vocab_size,
-            cache_dir=os.path.join(args.cache_dir, "vocab_mapping"),
-            cache_key=cache_key,
+    tokenizer = None
+    if is_online or args.eval_data_path is not None:
+        tokenizer = AutoTokenizer.from_pretrained(
+            args.target_model_path, trust_remote_code=args.trust_remote_code
         )
 
-        if not is_online:
+    # convert to dataloader
+    if is_online:
+        cache_params_string = (
+            f"{args.train_data_path}-"
+            f"{args.max_length}-"
+            f"{args.chat_template}-"
+            f"{args.target_model_path}"  # Tokenizer may also different
+        )
+    else:
+        cache_params_string = (
+            f"{args.train_hidden_states_path}-"
+            f"{args.max_length}-"
+            f"{args.target_model_path}-"
+            "offline_hidden_states_vocab_v1"
+        )
+    cache_key = hashlib.md5(cache_params_string.encode()).hexdigest()
+    with rank_0_priority():
+        if is_online:
+            train_dataset = Dataset.from_generator(
+                generator=safe_conversations_generator,
+                gen_kwargs={"file_path": args.train_data_path},
+            )
+            train_eagle3_dataset = build_eagle3_dataset(
+                dataset=train_dataset,
+                tokenizer=tokenizer,
+                chat_template=args.chat_template,
+                max_length=args.max_length,
+                cache_dir=os.path.join(args.cache_dir, "processed_dataset"),
+                cache_key=cache_key,
+                is_vlm=args.is_vlm,
+                is_preformatted=args.is_preformatted,
+                processor=processor,
+                num_proc=args.build_dataset_num_proc,
+                train_only_last_turn=args.train_only_last_turn,
+            )
+            vocab_mapping_path = generate_vocab_mapping_file(
+                dataset=train_eagle3_dataset,
+                target_vocab_size=draft_model_config.vocab_size,
+                draft_vocab_size=draft_model_config.draft_vocab_size,
+                cache_dir=os.path.join(args.cache_dir, "vocab_mapping"),
+                cache_key=cache_key,
+            )
+        else:
+            vocab_mapping_path = generate_vocab_mapping_file_from_hidden_states(
+                hidden_states_path=args.train_hidden_states_path,
+                target_vocab_size=draft_model_config.vocab_size,
+                draft_vocab_size=draft_model_config.draft_vocab_size,
+                cache_dir=os.path.join(args.cache_dir, "vocab_mapping"),
+                cache_key=cache_key,
+                max_length=args.max_length,
+            )
             train_eagle3_dataset = build_offline_eagle3_dataset(
                 args.train_hidden_states_path,
                 args.max_length,
@@ -501,7 +524,7 @@ def build_dataloaders(
             if args.attention_backend == "usp" and not is_online
             else get_dp_group()
         ),
-        is_vlm=args.is_vlm,
+        is_vlm=args.is_vlm and is_online,
     )
     if args.eval_data_path is not None or args.eval_hidden_states_path is not None:
         if args.eval_data_path is not None:
@@ -537,7 +560,7 @@ def build_dataloaders(
                 if args.attention_backend == "usp" and not is_online
                 else get_dp_group()
             ),
-            is_vlm=args.is_vlm,
+            is_vlm=args.is_vlm and is_online,
         )
         print_with_rank("Initialized eval dataloader")
     else:
@@ -598,7 +621,7 @@ def run_forward(
     target_model: Optional[Eagle3TargetModel] = None,
     is_online: bool = True,
 ) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
-    if args.is_vlm and args.target_model_backend == "custom":
+    if is_online and args.is_vlm and args.target_model_backend == "custom":
         plosses, _, acces = eagle3_model(
             input_ids=data["input_ids"].cuda(),
             attention_mask=data["attention_mask"].cuda(),
@@ -661,7 +684,7 @@ def run_forward(
                 data["position_ids"].cuda() if "position_ids" in data else None
             ),
             image_grid_thw=image_grid_thw,
-            is_vlm=args.is_vlm,
+            is_vlm=args.is_vlm and is_online,
         )
     return plosses, acces
 
