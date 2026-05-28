@@ -50,6 +50,34 @@ class TargetHead(nn.Module):
         lm_head_key: str = "lm_head.weight",
         cache_dir: Optional[str] = None,
     ):
+        def _resolve_lm_head_key(weight_map, requested_key):
+            candidates = [
+                requested_key,
+                "lm_head.weight",
+                "language_model.lm_head.weight",
+                "language_model.model.lm_head.weight",
+                "model.lm_head.weight",
+            ]
+            for key in candidates:
+                if key in weight_map:
+                    if key != requested_key:
+                        print(
+                            f"LM head key '{requested_key}' not found; using '{key}' instead."
+                        )
+                    return key
+            suffix_matches = [
+                key for key in weight_map if key.endswith("lm_head.weight")
+            ]
+            if len(suffix_matches) == 1:
+                key = suffix_matches[0]
+                print(
+                    f"LM head key '{requested_key}' not found; using '{key}' instead."
+                )
+                return key
+            raise KeyError(
+                f"LM head key '{requested_key}' not found. Available lm_head keys: {suffix_matches[:20]}"
+            )
+
         if os.path.exists(model_path):
             self.model_path = model_path
         else:
@@ -70,6 +98,7 @@ class TargetHead(nn.Module):
 
         with open(index_json_path, "r") as f:
             index_json = json.load(f)
+        lm_head_key = _resolve_lm_head_key(index_json["weight_map"], lm_head_key)
         ckpt_file = index_json["weight_map"][lm_head_key]
 
         if ckpt_file.endswith(".safetensors"):

@@ -125,6 +125,34 @@ class Eagle3DraftModel(PreTrainedModel, ABC):
             model_path (str): Path to the target model. Can be either a Hugging Face
             repository ID or a local directory path containing the model files.
         """
+        def _resolve_embedding_key(weight_map, requested_key):
+            candidates = [
+                requested_key,
+                "model.embed_tokens.weight",
+                "language_model.model.embed_tokens.weight",
+                "language_model.embed_tokens.weight",
+                "model.language_model.embed_tokens.weight",
+            ]
+            for key in candidates:
+                if key in weight_map:
+                    if key != requested_key:
+                        print(
+                            f"Embedding key '{requested_key}' not found; using '{key}' instead."
+                        )
+                    return key
+            suffix_matches = [
+                key for key in weight_map if key.endswith("embed_tokens.weight")
+            ]
+            if len(suffix_matches) == 1:
+                key = suffix_matches[0]
+                print(
+                    f"Embedding key '{requested_key}' not found; using '{key}' instead."
+                )
+                return key
+            raise KeyError(
+                f"Embedding key '{requested_key}' not found. Available embed keys: {suffix_matches[:20]}"
+            )
+
         if os.path.exists(model_path):
             # model_path is a local directory
             # check if there is file ending with index.json
@@ -156,6 +184,9 @@ class Eagle3DraftModel(PreTrainedModel, ABC):
 
             with open(index_json_path, "r") as f:
                 index_json = json.load(f)
+            embedding_key = _resolve_embedding_key(
+                index_json["weight_map"], embedding_key
+            )
             ckpt_file = index_json["weight_map"][embedding_key]
 
             if ckpt_file.endswith(".safetensors"):

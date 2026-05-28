@@ -123,21 +123,26 @@ def _collapse_empty_think_before_reasoning(text: str) -> str:
     return re.sub(r"<think>\s*</think>\s*<think>", "<think>", text)
 
 
-def _expand_kimi_media_pad(processor, text: str, image: str) -> str:
+def _expand_kimi_media_pad(
+    processor,
+    text: str,
+    image: str,
+    num_tokens: Optional[int] = None,
+) -> str:
     media_token = "<|media_pad|>"
     if media_token not in text:
         return text
 
-    media_processor = getattr(processor, "media_processor", None)
-    media_tokens_calculator = getattr(
-        media_processor, "media_tokens_calculator", None
-    )
-    if media_tokens_calculator is None:
-        return text
-
-    num_tokens = int(
-        media_tokens_calculator({"type": "image", "image": image})
-    )
+    if num_tokens is None:
+        media_processor = getattr(processor, "media_processor", None)
+        media_tokens_calculator = getattr(
+            media_processor, "media_tokens_calculator", None
+        )
+        if media_tokens_calculator is None:
+            return text
+        num_tokens = int(
+            media_tokens_calculator({"type": "image", "image": image})
+        )
     if num_tokens <= 1:
         return text
     return re.sub(
@@ -145,6 +150,86 @@ def _expand_kimi_media_pad(processor, text: str, image: str) -> str:
         media_token * num_tokens,
         text,
         count=1,
+    )
+
+
+def _extract_grid_thws(encoding) -> Optional[torch.Tensor]:
+    for key in ("grid_thws", "image_grid_thw"):
+        if key in encoding:
+            grid_thws = encoding[key]
+            if grid_thws.dim() == 1:
+                grid_thws = grid_thws[None, :]
+            return grid_thws
+    return None
+
+
+def _get_kimi_merge_kernel_size(processor) -> Tuple[int, int]:
+    candidates = [
+        processor,
+        getattr(processor, "media_processor", None),
+        getattr(processor, "image_processor", None),
+        getattr(getattr(processor, "media_processor", None), "image_processor", None),
+        getattr(processor, "vision_config", None),
+        getattr(getattr(processor, "media_processor", None), "config", None),
+        getattr(getattr(processor, "media_processor", None), "vision_config", None),
+    ]
+    for candidate in candidates:
+        merge_kernel_size = getattr(candidate, "merge_kernel_size", None)
+        if (
+            isinstance(merge_kernel_size, (list, tuple))
+            and len(merge_kernel_size) == 2
+        ):
+            return max(1, int(merge_kernel_size[0])), max(1, int(merge_kernel_size[1]))
+    return 2, 2
+
+
+def _compute_kimi_media_tokens_from_grid(
+    processor,
+    grid_thws: Optional[torch.Tensor],
+) -> Optional[int]:
+    if grid_thws is None:
+        return None
+    if grid_thws.dim() == 1:
+        grid_thws = grid_thws[None, :]
+    kh, kw = _get_kimi_merge_kernel_size(processor)
+    num_tokens = 0
+    for row in grid_thws.tolist():
+        if len(row) < 3:
+            continue
+        _t, h, w = int(row[0]), int(row[1]), int(row[2])
+        num_tokens += max(1, h // kh) * max(1, w // kw)
+    return max(1, int(num_tokens)) if num_tokens > 0 else None
+
+
+def _processor_call_with_kimi_media_pad(
+    processor,
+    text: str,
+    image: str,
+    max_length: int,
+):
+    media = {"type": "image", "image": image}
+    encoding = processor(
+        text=[text],
+        medias=[media],
+        max_length=max_length,
+        truncation=True,
+        return_tensors="pt",
+        return_offsets_mapping=True,
+        add_special_tokens=False,
+    )
+    grid_thws = _extract_grid_thws(encoding)
+    num_tokens = _compute_kimi_media_tokens_from_grid(processor, grid_thws)
+    expanded_text = _expand_kimi_media_pad(processor, text, image, num_tokens)
+    if expanded_text == text:
+        return encoding
+    return processor(
+        text=[expanded_text],
+        medias=[media],
+        max_length=max_length,
+        truncation=True,
+        return_tensors="pt",
+        return_offsets_mapping=True,
+        add_special_tokens=False,
     )
 
 
@@ -314,18 +399,13 @@ def preprocess_vlm_conversations(
         images = examples.get("image", [None] * len(examples["text"]))
         for text, image in zip(examples["text"], images):
             if image is not None:
-                media = {"type": "image", "image": image}
                 text = _collapse_empty_think_before_reasoning(text)
-                text = _expand_kimi_media_pad(processor, text, image)
                 try:
-                    encoding = processor(
-                        text=[text],
-                        medias=[media],
-                        max_length=max_length,
-                        truncation=True,
-                        return_tensors="pt",
-                        return_offsets_mapping=True,
-                        add_special_tokens=False,
+                    encoding = _processor_call_with_kimi_media_pad(
+                        processor,
+                        text,
+                        image,
+                        max_length,
                     )
                 except (TypeError, ValueError):
                     if not HAS_QWEN_VL_UTILS:
@@ -435,16 +515,12 @@ def preprocess_vlm_conversations(
             add_generation_prompt=False,
         )
         conversation = _collapse_empty_think_before_reasoning(conversation)
-        conversation = _expand_kimi_media_pad(processor, conversation, image)
         if hasattr(processor, "media_processor"):
-            encoding = processor(
-                text=[conversation],
-                medias=[{"type": "image", "image": image}],
-                max_length=max_length,
-                truncation=True,
-                return_tensors="pt",
-                return_offsets_mapping=True,
-                add_special_tokens=False,
+            encoding = _processor_call_with_kimi_media_pad(
+                processor,
+                conversation,
+                image,
+                max_length,
             )
         else:
             # get vision infor use qwen_vl_utils
